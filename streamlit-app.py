@@ -37,7 +37,7 @@ if INDEX_NAME not in pc.list_indexes().names():
 
 index = pc.Index(INDEX_NAME)
 
-CUSTOM_PROMPT = """You are a legal contract review assistant for business operations at Spring Care, Inc.
+SYSTEM_PROMPT = """You are a legal contract review assistant for business operations at Spring Care, Inc.
 
 You have access to a database table named contracts_insights_llm_parsed, which contains metadata and OCRed contract texts for our customer agreements. Each row in this table represents a single contract with columns that include key details extracted from the contract, such as customer name, contract type, dates, pricing terms, and more. In addition, there is a column named merged_text_chunk that contains the full OCRed and concatenated text of the original contract.
 
@@ -70,18 +70,7 @@ Your job is to answer user questions about our contracts and contracting history
 
 You are thorough, precise, and never make assumptions not supported by the data. If a question cannot be answered from the available sources, say so.
 
-When possible, provide both a summary answer and direct supporting quotes from the contract text.
-
----
-
-You may now begin answering user questions about contracts.
-
-Based on the following retrieved documents, please answer the query.
-Query: {query}
-Retrieved Documents:
-{context}
-Answer:
-"""
+When possible, provide both a summary answer and direct supporting quotes from the contract text."""
 
 def create_embedding(text: str) -> List[float]:
     """
@@ -117,13 +106,16 @@ treat it as an independent question and return it as is.
 
 <Standalone question>"""
     
-    response = client.completions.create(
-        model="gpt-3.5-turbo-instruct",
-        prompt=prompt,
-        max_tokens=200,
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You rewrite follow-up questions to be standalone based on conversation context."},
+            {"role": "user", "content": prompt}
+        ],
         temperature=0.1
     )
-    return response.choices[0].text.strip()
+    
+    return response.choices[0].message.content.strip()
 
 def extract_metadata_filters(query: str) -> Dict[str, str]:
     """
@@ -161,6 +153,31 @@ Query: {query}
     except:
         return {}
 
+def get_unique_customer_names() -> List[str]:
+    """
+    Retrieve unique customer names from Pinecone index metadata.
+    """
+    try:
+        # First try to create a simple query to get some documents
+        sample_query = create_embedding("contract")
+        results = index.query(
+            vector=sample_query,
+            top_k=100,
+            include_metadata=True
+        )
+        
+        # Extract unique customer names from the metadata
+        customer_names = set()
+        for match in results["matches"]:
+            metadata = match.get("metadata", {})
+            if "customer_name" in metadata and metadata["customer_name"]:
+                customer_names.add(metadata["customer_name"])
+        
+        return ["All Customers"] + sorted(list(customer_names))
+    except Exception as e:
+        logging.error(f"Error retrieving customer names: {e}")
+        return ["All Customers", "Acme Corp", "XYZ Health", "Sunrise Medical", "TechCare Solutions"]
+
 def query_similar_documents(query_text: str, top_k: int = 30, metadata_filters: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     """
     Find documents similar to the query text using Pinecone vector store with optional metadata filtering.
@@ -197,7 +214,7 @@ def query_similar_documents(query_text: str, top_k: int = 30, metadata_filters: 
         similar_docs.append({
             "id": match["id"],
             "score": match["score"],
-            "text_preview": text_content,
+            "text_preview": text_content[:200] + "..." if len(text_content) > 200 else text_content,
             "full_text": text_content,
             "metadata": {k: v for k, v in metadata.items() if k != "text"}
         })
@@ -219,16 +236,48 @@ Query: {query}
 Classification (just return the classification word):
 """
     
-    response = client.completions.create(
-        model="gpt-3.5-turbo-instruct",
-        prompt=prompt,
-        max_tokens=20,
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You classify contract queries into predefined categories."},
+            {"role": "user", "content": prompt}
+        ],
         temperature=0.1
     )
     
-    return response.choices[0].text.strip().lower()
+    return response.choices[0].message.content.strip().lower()
 
-def rag_query(query: str, max_tokens: int = 1000) -> Dict:
+def chunk_documents(docs: List[Dict[str, Any]], max_chunks: int = 10) -> List[List[Dict[str, Any]]]:
+    """
+    Split a list of documents into smaller chunks to avoid context length issues.
+    """
+    chunk_size = max(1, len(docs) // max_chunks)
+    return [docs[i:i + chunk_size] for i in range(0, len(docs), chunk_size)]
+
+def process_chunk_with_llm(query: str, docs_chunk: List[Dict[str, Any]]) -> str:
+    """
+    Process a chunk of documents with the LLM and return insights.
+    """
+    # Format the context for the prompt
+    context = "\n\n".join([
+        f"Document {i+1}:\n" + 
+        f"Metadata: {doc['metadata']}\n" + 
+        f"Content: {doc['full_text'][:2000]}..." if len(doc['full_text']) > 2000 else doc['full_text']
+        for i, doc in enumerate(docs_chunk)
+    ])
+    
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo-16k",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Based on the following documents, extract information relevant to this query: {query}\n\nDocuments:\n{context}"}
+        ],
+        temperature=0.7
+    )
+    
+    return response.choices[0].message.content
+
+def rag_query(query: str) -> Dict:
     """
     Perform a RAG query - retrieve relevant documents and generate a response.
     """
@@ -251,24 +300,53 @@ def rag_query(query: str, max_tokens: int = 1000) -> Dict:
         # For general queries, use standard semantic search
         similar_docs = query_similar_documents(query, top_k=20)
     
-    # Format the context for the prompt
-    context = "\n\n".join([f"Document {i+1}:\n{doc['full_text']}\nMetadata: {doc['metadata']}" 
-                         for i, doc in enumerate(similar_docs)])
+    # If we have too many documents, process them in chunks to avoid context length issues
+    insights = []
     
-    prompt = CUSTOM_PROMPT.format(
-        query=query,
-        context=context
-    )
-    
-    response = client.completions.create(
-        model="gpt-3.5-turbo-instruct",
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=0.7
-    )
+    if len(similar_docs) > 10:
+        # Process in chunks
+        chunks = chunk_documents(similar_docs)
+        with st.status("Processing documents in chunks...", expanded=True) as status:
+            for i, chunk in enumerate(chunks):
+                status.update(label=f"Processing chunk {i+1}/{len(chunks)}...")
+                chunk_insight = process_chunk_with_llm(query, chunk)
+                insights.append(chunk_insight)
+        
+        # Now send a final query to summarize all insights
+        all_insights = "\n\n".join([f"Insight {i+1}:\n{insight}" for i, insight in enumerate(insights)])
+        
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Based on the following insights extracted from contract documents, please provide a comprehensive answer to this query: {query}\n\nInsights:\n{all_insights}"}
+            ],
+            temperature=0.7
+        )
+        
+        final_response = response.choices[0].message.content
+    else:
+        # For smaller document sets, process directly
+        context = "\n\n".join([
+            f"Document {i+1}:\n" + 
+            f"Metadata: {doc['metadata']}\n" + 
+            f"Content: {doc['full_text'][:2000]}..." if len(doc['full_text']) > 2000 else doc['full_text']
+            for i, doc in enumerate(similar_docs)
+        ])
+        
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo-16k",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Based on the following documents, please answer this query: {query}\n\nDocuments:\n{context}"}
+            ],
+            temperature=0.7
+        )
+        
+        final_response = response.choices[0].message.content
     
     return {
-        "response": response.choices[0].text.strip(),
+        "response": final_response,
         "source_nodes": similar_docs,
         "query_type": query_type,
         "metadata_filters": metadata_filters
@@ -280,8 +358,14 @@ def reset_conversation():
     ai_intro = "Hello, I'm your Legal Contract Review Assistant. What can I help you with?"
     st.session_state.messages.append({"role": "assistant", "content": ai_intro})
 
+# Initialize session state
 if "messages" not in st.session_state:
     reset_conversation()
+
+# Get customer list for sidebar (only once per session)
+if "customer_list" not in st.session_state:
+    with st.spinner("Loading customer list..."):
+        st.session_state.customer_list = get_unique_customer_names()
 
 # Display title and reset button in the same row
 col1, col2 = st.columns([5, 1])
@@ -299,8 +383,7 @@ with st.sidebar:
     
     # Customer filter for direct search
     st.subheader("Direct Customer Search")
-    customers = ["All Customers", "Acme Corp", "XYZ Health", "Sunrise Medical", "TechCare Solutions"]  # Replace with actual customer list
-    selected_customer = st.selectbox("Select a customer to focus on:", customers)
+    selected_customer = st.selectbox("Select a customer to focus on:", st.session_state.customer_list)
     
     if st.button("Search All Contracts for Selected Customer"):
         if selected_customer != "All Customers":
@@ -368,17 +451,4 @@ if user_input:
                     st.markdown("---")
     
     # Add response to session state
-    st.session_state.messages.append({"role": "assistant", "content": response["response"]})
-
-with st.container():    
-    last_output_message = []
-    last_user_message = []
-
-    for message in reversed(st.session_state.messages):
-        if message["role"] == "assistant":
-            last_output_message = message
-            break
-    for message in reversed(st.session_state.messages):
-        if message["role"] == "user":
-            last_user_message = message
-            break 
+    st.session_state.messages.append({"role": "assistant", "content": response["response"]}) 
