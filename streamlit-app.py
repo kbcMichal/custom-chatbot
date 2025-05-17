@@ -444,9 +444,9 @@ if user_input:
                     meta_summary = ", ".join([f"**{k}**: {v}" for k, v in source_node['metadata'].items()])
                     st.markdown(meta_summary)
                     
-                    # Show the document text in a collapsible section
-                    with st.expander(f"View Document {i+1} Text"):
-                        st.markdown(source_node['full_text'])
+                    # Show the document text using a collapsible checkbox instead of nested expander
+                    if st.checkbox(f"View Document {i+1} Text", key=f"doc_{i}"):
+                        st.text_area("Document Content", source_node['full_text'], height=250, disabled=True)
                     
                     st.markdown("---")
     
