@@ -4,14 +4,14 @@ import streamlit as st
 from openai import OpenAI
 from pinecone import Pinecone
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 
-st.set_page_config(page_title="RAG Assistant", page_icon="🤖")
+st.set_page_config(page_title="RAG Assistant", page_icon="🤖", layout="wide")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
@@ -65,6 +65,8 @@ Your job is to answer user questions about our contracts and contracting history
 - If multiple contracts or amendments exist for a customer, ensure your answer accounts for all relevant documents and their dates.
 - For questions about contract types, use the contract_type column for classification (e.g., "Amendment", "Services Agreement", "Order Form", etc.).
 - If asked for a summary or detailed policy, synthesize information from both structured columns and the full text for accuracy.
+- Remember to consider ALL relevant contracts in the database that match the query criteria, not just the first few or ones mentioned earlier in the conversation.
+- Each question should be treated independently of previous questions, unless it explicitly references a previous question.
 
 You are thorough, precise, and never make assumptions not supported by the data. If a question cannot be answered from the available sources, say so.
 
@@ -104,6 +106,9 @@ def condense_question(chat_history, question):
 rewrite the message to be a standalone question that captures all relevant context 
 from the conversation.
 
+IMPORTANT: If the follow-up question seems to be asking about a completely new topic or doesn't explicitly reference the previous conversation,
+treat it as an independent question and return it as is.
+
 <Chat History> 
 {chat_history_text}
 
@@ -120,17 +125,69 @@ from the conversation.
     )
     return response.choices[0].text.strip()
 
-def query_similar_documents(query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
+def extract_metadata_filters(query: str) -> Dict[str, str]:
     """
-    Find documents similar to the query text using Pinecone vector store.
+    Analyze the query to extract potential metadata filters.
+    """
+    prompt = f"""
+Analyze the following query for potential metadata filters for a contract database search.
+The metadata fields available include: customer_name, contract_type, effective_date, expiration_date.
+
+If the query mentions a specific customer, contract type, or date range, extract these as filters.
+Return ONLY a JSON object with the filters, nothing else. If no filters are found, return an empty JSON object.
+
+Example query: "What marketing rights do we have in the contract with Acme Corp?"
+Example response: {{"customer_name": "Acme Corp"}}
+
+Example query: "Which MSAs were signed in 2023?"
+Example response: {{"contract_type": "MSA", "effective_date": "2023"}}
+
+Query: {query}
+"""
+    
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You extract structured metadata filters from natural language queries about contracts."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1
+    )
+    
+    try:
+        import json
+        filters = json.loads(response.choices[0].message.content)
+        return filters
+    except:
+        return {}
+
+def query_similar_documents(query_text: str, top_k: int = 30, metadata_filters: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """
+    Find documents similar to the query text using Pinecone vector store with optional metadata filtering.
     """
     query_embedding = create_embedding(query_text)
     
-    results = index.query(
-        vector=query_embedding,
-        top_k=top_k,
-        include_metadata=True
-    )
+    # Prepare filter dict for Pinecone if metadata filters are provided
+    filter_dict = {}
+    if metadata_filters:
+        for key, value in metadata_filters.items():
+            if value:  # Only add non-empty filters
+                filter_dict[key] = {"$eq": value}
+    
+    # Execute query with or without filters
+    if filter_dict:
+        results = index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True,
+            filter=filter_dict
+        )
+    else:
+        results = index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True
+        )
     
     similar_docs = []
     for match in results["matches"]:
@@ -147,13 +204,55 @@ def query_similar_documents(query_text: str, top_k: int = 5) -> List[Dict[str, A
     
     return similar_docs
 
+def analyze_query_type(query: str) -> str:
+    """
+    Analyze if query is about all contracts or specific ones.
+    Returns: "all_scan", "targeted", or "general"
+    """
+    prompt = f"""
+Analyze the following query about contracts and classify it as one of these types:
+1. "all_scan" - Requires scanning ALL contracts to answer (e.g., "Which customers allow marketing?", "List all contracts that permit us to use their logo")
+2. "targeted" - Asks about specific customer(s) or specific contract(s) (e.g., "What are the termination clauses in our contract with Acme Corp?")
+3. "general" - General question that doesn't fall into above categories
+
+Query: {query}
+Classification (just return the classification word):
+"""
+    
+    response = client.completions.create(
+        model="gpt-3.5-turbo-instruct",
+        prompt=prompt,
+        max_tokens=20,
+        temperature=0.1
+    )
+    
+    return response.choices[0].text.strip().lower()
+
 def rag_query(query: str, max_tokens: int = 1000) -> Dict:
     """
     Perform a RAG query - retrieve relevant documents and generate a response.
     """
-    similar_docs = query_similar_documents(query, top_k=3)
+    # Analyze query type to determine search strategy
+    query_type = analyze_query_type(query)
+    logging.info(f"Query type detected: {query_type}")
     
-    context = "\n\n".join([f"Document {i+1}:\n{doc['full_text']}" 
+    # Extract potential metadata filters
+    metadata_filters = extract_metadata_filters(query)
+    logging.info(f"Extracted metadata filters: {metadata_filters}")
+    
+    # Adjust retrieval strategy based on query type
+    if query_type == "all_scan":
+        # For all_scan queries, we need to retrieve many more documents
+        similar_docs = query_similar_documents(query, top_k=100, metadata_filters=metadata_filters)
+    elif query_type == "targeted" and metadata_filters:
+        # For targeted queries with metadata, use metadata filtering
+        similar_docs = query_similar_documents(query, top_k=20, metadata_filters=metadata_filters)
+    else:
+        # For general queries, use standard semantic search
+        similar_docs = query_similar_documents(query, top_k=20)
+    
+    # Format the context for the prompt
+    context = "\n\n".join([f"Document {i+1}:\n{doc['full_text']}\nMetadata: {doc['metadata']}" 
                          for i, doc in enumerate(similar_docs)])
     
     prompt = CUSTOM_PROMPT.format(
@@ -170,16 +269,44 @@ def rag_query(query: str, max_tokens: int = 1000) -> Dict:
     
     return {
         "response": response.choices[0].text.strip(),
-        "source_nodes": similar_docs
+        "source_nodes": similar_docs,
+        "query_type": query_type,
+        "metadata_filters": metadata_filters
     }
 
-if "messages" not in st.session_state:
+def reset_conversation():
+    """Reset the conversation history"""
     st.session_state.messages = []
     ai_intro = "Hello, I'm your Legal Contract Review Assistant. What can I help you with?"
     st.session_state.messages.append({"role": "assistant", "content": ai_intro})
 
-# Display title
-st.title("Legal Contract Review Assistant")
+if "messages" not in st.session_state:
+    reset_conversation()
+
+# Display title and reset button in the same row
+col1, col2 = st.columns([5, 1])
+with col1:
+    st.title("Legal Contract Review Assistant")
+with col2:
+    if st.button("Reset Chat"):
+        reset_conversation()
+        st.rerun()
+
+# Add a sidebar with search options
+with st.sidebar:
+    st.header("Search Options")
+    st.info("For questions about all contracts (like 'Which customers allow marketing?'), the assistant will scan more documents to find comprehensive answers.")
+    
+    # Customer filter for direct search
+    st.subheader("Direct Customer Search")
+    customers = ["All Customers", "Acme Corp", "XYZ Health", "Sunrise Medical", "TechCare Solutions"]  # Replace with actual customer list
+    selected_customer = st.selectbox("Select a customer to focus on:", customers)
+    
+    if st.button("Search All Contracts for Selected Customer"):
+        if selected_customer != "All Customers":
+            user_input = f"Show me all contracts with {selected_customer}"
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            st.rerun()
 
 # Display history
 for message in st.session_state.messages:
@@ -218,15 +345,27 @@ if user_input:
         # Update placeholder with response
         message_placeholder.markdown(response["response"])
         
-        # Show sources
-        with st.expander("Sources"):
-            for i, source_node in enumerate(response["source_nodes"]):
-                st.markdown(f"**Source {i+1}**")
-                st.markdown(source_node["full_text"])
-                st.markdown("---")
-                st.markdown("**Metadata:**")
-                for key, value in source_node["metadata"].items():
-                    st.markdown(f"- **{key}**: {value}")
+        # Show query analysis and sources
+        col1, col2 = st.columns(2)
+        with col1:
+            with st.expander("Query Analysis"):
+                st.markdown(f"**Query Type:** {response['query_type']}")
+                st.markdown(f"**Metadata Filters:** {response['metadata_filters']}")
+                st.markdown(f"**Documents Retrieved:** {len(response['source_nodes'])}")
+        
+        with col2:
+            with st.expander("Sources"):
+                for i, source_node in enumerate(response['source_nodes']):
+                    st.markdown(f"**Source {i+1}**")
+                    # Display a compact metadata summary first
+                    meta_summary = ", ".join([f"**{k}**: {v}" for k, v in source_node['metadata'].items()])
+                    st.markdown(meta_summary)
+                    
+                    # Show the document text in a collapsible section
+                    with st.expander(f"View Document {i+1} Text"):
+                        st.markdown(source_node['full_text'])
+                    
+                    st.markdown("---")
     
     # Add response to session state
     st.session_state.messages.append({"role": "assistant", "content": response["response"]})
