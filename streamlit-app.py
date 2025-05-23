@@ -67,6 +67,7 @@ Your job is to answer user questions about our contracts and contracting history
 - If asked for a summary or detailed policy, synthesize information from both structured columns and the full text for accuracy.
 - Remember to consider ALL relevant contracts in the database that match the query criteria, not just the first few or ones mentioned earlier in the conversation.
 - Each question should be treated independently of previous questions, unless it explicitly references a previous question.
+- ALWAYS include the filename in your answer, referencing where the information was found. This is REQUIRED for every response.
 
 You are thorough, precise, and never make assumptions not supported by the data. If a question cannot be answered from the available sources, say so.
 
@@ -107,7 +108,7 @@ treat it as an independent question and return it as is.
 <Standalone question>"""
     
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4.1",
         messages=[
             {"role": "system", "content": "You rewrite follow-up questions to be standalone based on conversation context."},
             {"role": "user", "content": prompt}
@@ -123,22 +124,22 @@ def extract_metadata_filters(query: str) -> Dict[str, str]:
     """
     prompt = f"""
 Analyze the following query for potential metadata filters for a contract database search.
-The metadata fields available include: customer_name, contract_type, effective_date, expiration_date.
+The metadata fields available include: CUSTOMER_NAME, CONTRACT_TYPE, created_at, updated_at.
 
 If the query mentions a specific customer, contract type, or date range, extract these as filters.
 Return ONLY a JSON object with the filters, nothing else. If no filters are found, return an empty JSON object.
 
 Example query: "What marketing rights do we have in the contract with Acme Corp?"
-Example response: {{"customer_name": "Acme Corp"}}
+Example response: {{"CUSTOMER_NAME": "Acme Corp"}}
 
 Example query: "Which MSAs were signed in 2023?"
-Example response: {{"contract_type": "MSA", "effective_date": "2023"}}
+Example response: {{"CONTRACT_TYPE": "MSA", "created_at": "2023"}}
 
 Query: {query}
 """
     
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4.1",
         messages=[
             {"role": "system", "content": "You extract structured metadata filters from natural language queries about contracts."},
             {"role": "user", "content": prompt}
@@ -170,13 +171,14 @@ def get_unique_customer_names() -> List[str]:
         customer_names = set()
         for match in results["matches"]:
             metadata = match.get("metadata", {})
-            if "customer_name" in metadata and metadata["customer_name"]:
-                customer_names.add(metadata["customer_name"])
+            if "CUSTOMER_NAME" in metadata and metadata["CUSTOMER_NAME"]:
+                customer_names.add(metadata["CUSTOMER_NAME"])
         
+        # Convert to list, sort, and add "All Customers" at the beginning
         return ["All Customers"] + sorted(list(customer_names))
     except Exception as e:
         logging.error(f"Error retrieving customer names: {e}")
-        return ["All Customers", "Acme Corp", "XYZ Health", "Sunrise Medical", "TechCare Solutions"]
+        return ["All Customers"]
 
 def query_similar_documents(query_text: str, top_k: int = 30, metadata_filters: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     """
@@ -237,7 +239,7 @@ Classification (just return the classification word):
 """
     
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4.1",
         messages=[
             {"role": "system", "content": "You classify contract queries into predefined categories."},
             {"role": "user", "content": prompt}
@@ -262,15 +264,16 @@ def process_chunk_with_llm(query: str, docs_chunk: List[Dict[str, Any]]) -> str:
     context = "\n\n".join([
         f"Document {i+1}:\n" + 
         f"Metadata: {doc['metadata']}\n" + 
+        f"Filename: {doc['metadata'].get('filename', 'Unknown')}\n" + 
         f"Content: {doc['full_text'][:2000]}..." if len(doc['full_text']) > 2000 else doc['full_text']
         for i, doc in enumerate(docs_chunk)
     ])
     
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo-16k",
+        model="gpt-4.1",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Based on the following documents, extract information relevant to this query: {query}\n\nDocuments:\n{context}"}
+            {"role": "user", "content": f"Based on the following documents, extract information relevant to this query: {query}\n\nAlways include the filename in your answer where you found the information.\n\nDocuments:\n{context}"}
         ],
         temperature=0.7
     )
@@ -316,10 +319,10 @@ def rag_query(query: str) -> Dict:
         all_insights = "\n\n".join([f"Insight {i+1}:\n{insight}" for i, insight in enumerate(insights)])
         
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4.1",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Based on the following insights extracted from contract documents, please provide a comprehensive answer to this query: {query}\n\nInsights:\n{all_insights}"}
+                {"role": "user", "content": f"Based on the following insights extracted from contract documents, please provide a comprehensive answer to this query: {query}\n\nMake sure to include the filenames of the documents where you found the information.\n\nInsights:\n{all_insights}"}
             ],
             temperature=0.7
         )
@@ -330,15 +333,16 @@ def rag_query(query: str) -> Dict:
         context = "\n\n".join([
             f"Document {i+1}:\n" + 
             f"Metadata: {doc['metadata']}\n" + 
+            f"Filename: {doc['metadata'].get('filename', 'Unknown')}\n" + 
             f"Content: {doc['full_text'][:2000]}..." if len(doc['full_text']) > 2000 else doc['full_text']
             for i, doc in enumerate(similar_docs)
         ])
         
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo-16k",
+            model="gpt-4.1",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Based on the following documents, please answer this query: {query}\n\nDocuments:\n{context}"}
+                {"role": "user", "content": f"Based on the following documents, please answer this query: {query}\n\nAlways include the filename in your answer where you found the information.\n\nDocuments:\n{context}"}
             ],
             temperature=0.7
         )
@@ -375,21 +379,6 @@ with col2:
     if st.button("Reset Chat"):
         reset_conversation()
         st.rerun()
-
-# Add a sidebar with search options
-with st.sidebar:
-    st.header("Search Options")
-    st.info("For questions about all contracts (like 'Which customers allow marketing?'), the assistant will scan more documents to find comprehensive answers.")
-    
-    # Customer filter for direct search
-    st.subheader("Direct Customer Search")
-    selected_customer = st.selectbox("Select a customer to focus on:", st.session_state.customer_list)
-    
-    if st.button("Search All Contracts for Selected Customer"):
-        if selected_customer != "All Customers":
-            user_input = f"Show me all contracts with {selected_customer}"
-            st.session_state.messages.append({"role": "user", "content": user_input})
-            st.rerun()
 
 # Display history
 for message in st.session_state.messages:
@@ -451,4 +440,23 @@ if user_input:
                     st.markdown("---")
     
     # Add response to session state
-    st.session_state.messages.append({"role": "assistant", "content": response["response"]}) 
+    st.session_state.messages.append({"role": "assistant", "content": response["response"]})
+
+# Update the sidebar display of customers
+with st.sidebar:
+    st.header("Available Customers")
+    st.info("This is a list of all customers with contracts in the system.")
+    
+    # Customer listing in cleaner layout
+    if len(st.session_state.customer_list) > 1:  # If we have actual customers beyond "All Customers"
+        st.write("### Customer List")
+        
+        # Display customers in a scrollable container with better formatting
+        with st.container(height=400, border=True):
+            # Skip "All Customers" entry at index 0
+            # Use a set to ensure no duplicates in display
+            unique_customers = set(st.session_state.customer_list[1:])
+            for customer in sorted(unique_customers):
+                st.write(f"• {customer}")
+    else:
+        st.write("No customers found in database") 
